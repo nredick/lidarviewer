@@ -27,6 +27,7 @@ Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
 #include <iomanip>
 #include <string>
 #include <vector>
+#include <Misc/SizedTypes.h>
 #include <Misc/StdError.h>
 #include <Misc/Endianness.h>
 #include <Misc/FileNameExtensions.h>
@@ -39,6 +40,8 @@ Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
 #include <IO/ReadAheadFilter.h>
 #include <IO/ValueSource.h>
 #include <IO/OpenFile.h>
+#include <IO/ZipArchive.h>
+#include <IO/XMLDocument.h>
 #include <Math/Math.h>
 #include <Math/Constants.h>
 #include <Geometry/OrthogonalTransformation.h>
@@ -991,6 +994,225 @@ void loadPointFileIdl(PointAccumulator& pa,const char* fileName)
 	std::cout<<"mVir range: "<<massMin<<" - "<<massMax<<std::endl;
 	}
 
+/***********************************
+Helper structures to load X3P files:
+***********************************/
+
+struct X3P // Container structure
+	{
+	/* Embedded classes: */
+	public:
+	enum DataType // Enumerated type for scalar value types stored in binary point data files
+		{
+		Int32,Int64,Float32,Float64
+		};
+	
+	struct Axis // Definition of a measurement axis
+		{
+		/* Elements: */
+		public:
+		bool incremental; // Flag if the axis's positions are implicit
+		double offset,increment; // Offset and increment for implicit axes
+		DataType dataType; // Type of data stored with the axis
+		};
+	};
+
+const IO::XMLElement* getElement(const IO::XMLElement* current,const char* path)
+	{
+	/* Follow the path one component at the time from the document root: */
+	const char* compStart=path;
+	while(*compStart!='\0')
+		{
+		/* Find the end of the current path component: */
+		const char* compEnd;
+		for(compEnd=compStart;*compEnd!='\0'&&*compEnd!='/';++compEnd)
+			;
+		std::string compName(compStart,compEnd);
+		
+		/* Find the first sub-element whose name matches the current path component: */
+		const IO::XMLElement* child=current->findNextElement(compName.c_str(),0);
+		if(child==0)
+			throw Misc::makeStdErr(__PRETTY_FUNCTION__,"Path component %s not found in XML element",compName.c_str());
+		
+		current=child;
+		
+		/* Find the beginning of the next path component: */
+		compStart=compEnd;
+		while(*compStart=='/')
+			++compStart;
+		}
+	
+	return current;
+	}
+
+const IO::XMLElement* getElement(const IO::XMLDocument& doc,const char* path)
+	{
+	/* Skip an initial sequence of slashes in the path: */
+	while(*path=='/')
+		++path;
+	
+	/* Get the element from the document root: */
+	const IO::XMLElement* root=dynamic_cast<const IO::XMLElement*>(doc.getRoot());
+	if(root==0)
+		throw Misc::makeStdErr(__PRETTY_FUNCTION__,"XML document's root is not an XML element");
+	return getElement(root,path);
+	}
+
+const std::string& getCharacterData(const IO::XMLElement* current,const char* path)
+	{
+	/* Find the XML element indicated by the given path: */
+	const IO::XMLElement* element=getElement(current,path);
+	
+	/* Find the first character data node under the found element: */
+	const IO::XMLNode* chPtr=element->getChildren().front();
+	const IO::XMLCharacterData* cdPtr=0;
+	while(chPtr!=0&&cdPtr==0)
+		{
+		/* Check if the child is a character data node: */
+		cdPtr=dynamic_cast<const IO::XMLCharacterData*>(chPtr);
+		
+		/* Go to the next child: */
+		chPtr=chPtr->getSibling();
+		}
+	if(cdPtr==0)
+		throw Misc::makeStdErr(__PRETTY_FUNCTION__,"XML element does not contain character data");
+	
+	return cdPtr->getData();
+	}
+
+const std::string& getCharacterData(const IO::XMLDocument& doc,const char* path)
+	{
+	/* Skip an initial sequence of slashes in the path: */
+	while(*path=='/')
+		++path;
+	
+	/* Get the element from the document root: */
+	const IO::XMLElement* root=dynamic_cast<const IO::XMLElement*>(doc.getRoot());
+	if(root==0)
+		throw Misc::makeStdErr(__PRETTY_FUNCTION__,"XML document's root is not an XML element");
+	return getCharacterData(root,path);
+	}
+
+double readCoordinateX3P(IO::File& file,X3P::DataType dataType) // Reads a binary coordinate component of the given data type
+	{
+	switch(dataType)
+		{
+		case X3P::Int32:
+			return double(file.read<Misc::SInt32>());
+		
+		case X3P::Int64:
+			return double(file.read<Misc::SInt64>());
+		
+		case X3P::Float32:
+			return double(file.read<Misc::Float32>());
+		
+		case X3P::Float64:
+			return double(file.read<Misc::Float64>());
+		}
+	
+	/* Never reached; just to make compiler happy: */
+	return 0.0;
+	}
+
+void loadPointFileX3P(PointAccumulator& pa,const char* fileName)
+	{
+	/* Open the X3P file, which is actually a ZIP archive: */
+	IO::ZipArchive x3pArchive(fileName);
+	
+	/* Read the central main.xml file into an XML document: */
+	IO::XMLDocument main(*x3pArchive.openFile(x3pArchive.findFile("main.xml")));
+	
+	/* Access the Axes element: */
+	const IO::XMLElement* axesElement=getElement(main,"/Record1/Axes");
+	
+	/* Read the measurement matrix description: */
+	X3P::Axis axes[3];
+	for(int axisIndex=0;axisIndex<3;++axisIndex)
+		{
+		/* Go to the axis element: */
+		char axisName[3];
+		snprintf(axisName,sizeof(axisName),"C%c",'X'+axisIndex);
+		const IO::XMLElement* axis=getElement(axesElement,axisName);
+		
+		/* Parse the axis type: */
+		const std::string& axisType=getCharacterData(axis,"AxisType");
+		axes[axisIndex].incremental=axisType=="I";
+		axes[axisIndex].offset=0.0;
+		axes[axisIndex].increment=1.0;
+		if(axes[axisIndex].incremental)
+			{
+			/* Parse the axis offset: */
+			const std::string& offset=getCharacterData(axis,"Offset");
+			axes[axisIndex].offset=atof(offset.c_str());
+			
+			/* Parse the axis incremeent: */
+			const std::string& increment=getCharacterData(axis,"Increment");
+			axes[axisIndex].increment=atof(increment.c_str());
+			}
+		else if(axisType!="A")
+			throw Misc::makeStdErr(__PRETTY_FUNCTION__,"Invalid AxisType value %s",axisType.c_str());
+		
+		/* Parse the axis data type: */
+		const std::string& dataType=getCharacterData(axis,"DataType");
+		if(dataType=="I")
+			axes[axisIndex].dataType=X3P::Int32;
+		else if(dataType=="L")
+			axes[axisIndex].dataType=X3P::Int64;
+		else if(dataType=="F")
+			axes[axisIndex].dataType=X3P::Float32;
+		else if(dataType=="D")
+			axes[axisIndex].dataType=X3P::Float64;
+		else
+			throw Misc::makeStdErr(__PRETTY_FUNCTION__,"Invalid DataType value %s",dataType.c_str());
+		}
+	
+	/* Access the MatrixDimension element: */
+	const IO::XMLElement* matrixDimension=getElement(main,"/Record3/MatrixDimension");
+	
+	/* Parse the matrix dimensions: */
+	unsigned int matrixSize[3];
+	for(int axisIndex=0;axisIndex<3;++axisIndex)
+		{
+		/* Parse the matrix size: */
+		char sizeName[6];
+		snprintf(sizeName,sizeof(sizeName),"Size%c",'X'+axisIndex);
+		const std::string& size=getCharacterData(matrixDimension,sizeName);
+		matrixSize[axisIndex]=strtoul(size.c_str(),0,10);
+		}
+	
+	/* Read point data from a binary point data file: */
+	const std::string& pointDataLink=getCharacterData(main,"/Record3/DataLink/PointDataLink");
+	IO::FilePtr pointData=x3pArchive.openFile(x3pArchive.findFile(pointDataLink.c_str()));
+	pointData->setEndianness(Misc::LittleEndian);
+	
+	PointAccumulator::Color c(255,255,255);
+	PointAccumulator::Point p;
+	p[2]=axes[2].offset;
+	for(unsigned int z=0;z<matrixSize[2];++z,p[2]+=axes[2].increment)
+		{
+		p[1]=axes[1].offset;
+		for(unsigned int y=0;y<matrixSize[1];++y,p[1]+=axes[1].increment)
+			{
+			p[0]=axes[0].offset;
+			for(unsigned int x=0;x<matrixSize[0];++x,p[0]+=axes[0].increment)
+				{
+				/* Read the point position: */
+				bool valid=true;
+				for(int i=0;i<3;++i)
+					if(!axes[i].incremental)
+						{
+						p[i]=readCoordinateX3P(*pointData,axes[i].dataType);
+						valid=valid&&Math::isFinite(p[i]);
+						}
+				
+				/* Accumulate the point if it is valid: */
+				if(valid)
+					pa.addPoint(p,c);
+				}
+			}
+		}
+	}
+
 /**************************************
 Helper structures to load octree files:
 **************************************/
@@ -1155,6 +1377,7 @@ enum PointFileType // Enumerated type for point file formats
 	BLOCKEDASCII, // Blocked ASCII format with intensity data
 	BLOCKEDASCIIRGB, // Blocked ASCII format with RGB data
 	IDL, // Redshift data file in IDL format
+	X3PFORMAT, // X3P surface / profile format
 	OCTREE, // Point octree file in old file format
 	LIDAR, // LiDAR file in new octree file format
 	ILLEGAL
@@ -1513,6 +1736,8 @@ int main(int argc,char* argv[])
 				}
 			else if(strcasecmp(argv[i]+1,"idl")==0)
 				pointFileType=IDL;
+			else if(strcasecmp(argv[i]+1,"x3p")==0)
+				pointFileType=X3PFORMAT;
 			else if(strcasecmp(argv[i]+1,"oct")==0)
 				pointFileType=OCTREE;
 			else if(strcasecmp(argv[i]+1,"lidar")==0)
@@ -1545,6 +1770,8 @@ int main(int argc,char* argv[])
 					thisPointFileType=XYZI;
 				else if(strcasecmp(extPtr,".xyzrgb")==0)
 					thisPointFileType=XYZI;
+				else if(strcasecmp(extPtr,".x3p")==0)
+					thisPointFileType=X3PFORMAT;
 				else if(strcasecmp(extPtr,".oct")==0)
 					thisPointFileType=OCTREE;
 				else if(strcasecmp(extPtr,".LiDAR")==0)
@@ -1673,6 +1900,13 @@ int main(int argc,char* argv[])
 					std::cout<<" done."<<std::endl;
 					break;
 				
+				case X3PFORMAT:
+					std::cout<<"Processing X3P input file "<<argv[i]<<"..."<<std::flush;
+					loadPointFileX3P(pa,argv[i]);
+					havePoints=true;
+					std::cout<<" done."<<std::endl;
+					break;
+				
 				case OCTREE:
 					std::cout<<"Processing LiDAR octree input file "<<argv[i]<<"..."<<std::flush;
 					loadPointFileOctree(pa,argv[i]);
@@ -1725,6 +1959,7 @@ int main(int argc,char* argv[])
 		std::cerr<<"             -BLOCKEDASCII <x column> <y column> <z column> [<intensity column>]"<<std::endl;
 		std::cerr<<"             -BLOCKEDASCIIRGB <x column> <y column> <z column> [<r column> <g column> <b column>]"<<std::endl;
 		std::cerr<<"             -IDL"<<std::endl;
+		std::cerr<<"             -X3P"<<std::endl;
 		std::cerr<<"             -OCT"<<std::endl;
 		std::cerr<<"             -LIDAR"<<std::endl;
 		return 1;

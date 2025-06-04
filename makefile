@@ -49,7 +49,7 @@ PROJECT_DISPLAYNAME = LiDAR Viewer
 # other. The value should be identical to the major.minor version
 # number found in VERSION in the root package directory.
 PROJECT_MAJOR = 2
-PROJECT_MINOR = 21
+PROJECT_MINOR = 22
 
 # Include definitions for the system environment and system-provided
 # packages

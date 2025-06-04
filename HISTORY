@@ -207,3 +207,6 @@ LiDAR Viewer 2.21:
   graphs
 - Bumped Vrui version requirement to Vrui-13.1-001
 - Adjusted makefile to improved Vrui setup.
+
+LiDAR Viewer 2.22:
+- Added input filter for files in X3P format to LidarPreprocessor.
