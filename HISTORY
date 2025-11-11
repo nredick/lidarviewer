@@ -210,3 +210,5 @@ LiDAR Viewer 2.21:
 
 LiDAR Viewer 2.22:
 - Added input filter for files in X3P format to LidarPreprocessor.
+- Bumped Vrui version requirement to Vrui-14.0-001
+- Bumped Vrui collaboration infrastructure version requirement to 10.3
